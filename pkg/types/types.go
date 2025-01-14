@@ -17,8 +17,9 @@ type Price struct {
 	Reserves0     *big.Int
 	Reserves1     *big.Int
 	// Metadata about the price calculation
-	Path       []string // Addresses of tokens used to calculate USD price
-	Confidence float64  // 0-1 score of price confidence based on liquidity and path
+	Path       []string   // Addresses of tokens used to calculate USD price
+	Confidence float64    // 0-1 score of price confidence based on liquidity and path
+	TVL        *big.Float // Total Value Locked in USD
 }
 
 // PriceOpts contains options for price calculation
