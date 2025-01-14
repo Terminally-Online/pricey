@@ -20,6 +20,7 @@ import (
 type EthClient interface {
 	bind.ContractBackend
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
+	TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error)
 }
 
 // PairBindings defines the interface for interacting with Uniswap pairs
@@ -36,8 +37,10 @@ type PairBindings interface {
 
 // PriceUpdate represents a real-time price update from a pair
 type PriceUpdate struct {
-	*ptypes.Price
-	Error error
+	Price   *ptypes.Price
+	Error   error
+	Info    string
+	Warning string
 }
 
 // PriceSubscription represents an active price subscription
@@ -48,6 +51,20 @@ type PriceSubscription struct {
 	unsub   func()
 }
 
+// RetryConfig defines retry parameters for error recovery
+type RetryConfig struct {
+	MaxAttempts int
+	BackoffMin  time.Duration
+	BackoffMax  time.Duration
+}
+
+// DefaultRetryConfig provides default retry parameters
+var DefaultRetryConfig = RetryConfig{
+	MaxAttempts: 3,
+	BackoffMin:  time.Second,
+	BackoffMax:  time.Second * 30,
+}
+
 // Service manages Uniswap pair interactions
 type Service struct {
 	client      EthClient
@@ -55,14 +72,16 @@ type Service struct {
 	pairs       map[common.Address]PairBindings
 	subs        map[common.Address][]*PriceSubscription
 	watchCancel context.CancelFunc
+	retryConfig RetryConfig
 }
 
 // NewService creates a new Uniswap service
 func NewService(client EthClient) *Service {
 	return &Service{
-		client: client,
-		pairs:  make(map[common.Address]PairBindings),
-		subs:   make(map[common.Address][]*PriceSubscription),
+		client:      client,
+		pairs:       make(map[common.Address]PairBindings),
+		subs:        make(map[common.Address][]*PriceSubscription),
+		retryConfig: DefaultRetryConfig,
 	}
 }
 
@@ -155,21 +174,77 @@ func (s *Service) SubscribeToPrice(ctx context.Context, pairAddress common.Addre
 func (s *Service) handleSyncEvents(pairAddress common.Address, syncCh chan *bindings.BindingsSync, syncSub event.Subscription) {
 	defer syncSub.Unsubscribe()
 
+	backoff := s.retryConfig.BackoffMin
+	attempts := 0
+
 	for {
 		select {
 		case err := <-syncSub.Err():
-			s.broadcastError(pairAddress, fmt.Errorf("sync subscription error: %w", err))
-			return
+			if err == nil {
+				continue
+			}
+
+			// Broadcast the error immediately
+			s.broadcastError(pairAddress, fmt.Errorf("subscription error: %w", err))
+
+			if attempts >= s.retryConfig.MaxAttempts {
+				s.broadcastError(pairAddress, fmt.Errorf("max retry attempts reached: %w", err))
+				return
+			}
+
+			// Exponential backoff
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > s.retryConfig.BackoffMax {
+				backoff = s.retryConfig.BackoffMax
+			}
+			attempts++
+
+			// Attempt to resubscribe
+			pair, err := s.getPair(pairAddress)
+			if err != nil {
+				s.broadcastError(pairAddress, fmt.Errorf("failed to get pair during retry: %w", err))
+				continue
+			}
+
+			newSyncCh := make(chan *bindings.BindingsSync, 10)
+			newSyncSub, err := pair.WatchSync(&bind.WatchOpts{}, newSyncCh)
+			if err != nil {
+				s.broadcastError(pairAddress, fmt.Errorf("failed to resubscribe during retry: %w", err))
+				continue
+			}
+
+			// Update channels and continue monitoring
+			syncCh = newSyncCh
+			syncSub = newSyncSub
+			s.broadcastInfo(pairAddress, fmt.Sprintf("Successfully resubscribed after %d attempts", attempts))
 
 		case sync := <-syncCh:
 			if sync == nil {
 				continue
 			}
 
-			// Get latest price
-			price, err := s.GetPrice(context.Background(), pairAddress, nil)
+			// Reset retry counters on successful sync
+			backoff = s.retryConfig.BackoffMin
+			attempts = 0
+
+			// Get latest price with retries
+			var price *ptypes.Price
+			var err error
+			for i := 0; i < s.retryConfig.MaxAttempts; i++ {
+				price, err = s.GetPrice(context.Background(), pairAddress, nil)
+				if err == nil {
+					break
+				}
+				time.Sleep(backoff)
+				backoff *= 2
+				if backoff > s.retryConfig.BackoffMax {
+					backoff = s.retryConfig.BackoffMax
+				}
+			}
+
 			if err != nil {
-				s.broadcastError(pairAddress, fmt.Errorf("failed to get price: %w", err))
+				s.broadcastError(pairAddress, fmt.Errorf("failed to get price after retries: %w", err))
 				continue
 			}
 
@@ -183,9 +258,50 @@ func (s *Service) handleSyncEvents(pairAddress common.Address, syncCh chan *bind
 				select {
 				case sub.Updates <- update:
 				default:
-					// Skip if channel is full
+					// Log dropped update
+					s.broadcastWarning(pairAddress, "Dropped price update due to full channel")
 				}
 			}
+		}
+	}
+}
+
+// broadcastInfo sends an informational message to all subscribers
+func (s *Service) broadcastInfo(pairAddress common.Address, msg string) {
+	s.mu.RLock()
+	subs := s.subs[pairAddress]
+	s.mu.RUnlock()
+
+	update := PriceUpdate{
+		Price: nil,
+		Error: nil,
+		Info:  msg,
+	}
+
+	for _, sub := range subs {
+		select {
+		case sub.Updates <- update:
+		default:
+		}
+	}
+}
+
+// broadcastWarning sends a warning message to all subscribers
+func (s *Service) broadcastWarning(pairAddress common.Address, msg string) {
+	s.mu.RLock()
+	subs := s.subs[pairAddress]
+	s.mu.RUnlock()
+
+	update := PriceUpdate{
+		Price:   nil,
+		Error:   nil,
+		Warning: msg,
+	}
+
+	for _, sub := range subs {
+		select {
+		case sub.Updates <- update:
+		default:
 		}
 	}
 }
@@ -213,7 +329,36 @@ func (s *PriceSubscription) Unsubscribe() {
 	}
 }
 
+// GetPrice retrieves the current or historical price for a pair
 func (s *Service) GetPrice(ctx context.Context, pairAddress common.Address, opts *ptypes.PriceOpts) (*ptypes.Price, error) {
+	var price *ptypes.Price
+	var err error
+	backoff := s.retryConfig.BackoffMin
+
+	for i := 0; i < s.retryConfig.MaxAttempts; i++ {
+		price, err = s.getPriceInternal(ctx, pairAddress, opts)
+		if err == nil {
+			return price, nil
+		}
+
+		// Check if context is cancelled before retrying
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("context cancelled during price retrieval: %w", ctx.Err())
+		}
+
+		// Wait before retrying
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > s.retryConfig.BackoffMax {
+			backoff = s.retryConfig.BackoffMax
+		}
+	}
+
+	return nil, fmt.Errorf("max retry attempts reached: %w", err)
+}
+
+// getPriceInternal is the internal implementation of GetPrice without retries
+func (s *Service) getPriceInternal(ctx context.Context, pairAddress common.Address, opts *ptypes.PriceOpts) (*ptypes.Price, error) {
 	pair, err := s.getPair(pairAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pair: %w", err)

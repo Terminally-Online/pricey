@@ -2,7 +2,9 @@ package uniswap
 
 import (
 	"context"
+	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,6 +82,11 @@ func (m *MockEthClient) SuggestGasTipCap(ctx context.Context) (*big.Int, error) 
 	return args.Get(0).(*big.Int), args.Error(1)
 }
 
+func (m *MockEthClient) TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	args := m.Called(ctx, txHash)
+	return args.Get(0).(*types.Receipt), args.Error(1)
+}
+
 // MockBindings mocks the Uniswap pair contract bindings
 type MockBindings struct {
 	mock.Mock
@@ -119,14 +126,28 @@ func (m *MockBindings) WatchSync(opts *bind.WatchOpts, sink chan<- *bindings.Bin
 type MockSubscription struct {
 	mock.Mock
 	errChan chan error
+	done    chan struct{}
 }
 
 func (m *MockSubscription) Unsubscribe() {
 	m.Called()
+	if m.done != nil {
+		close(m.done)
+	}
 }
 
 func (m *MockSubscription) Err() <-chan error {
+	if m.errChan == nil {
+		m.errChan = make(chan error, 1)
+	}
 	return m.errChan
+}
+
+func NewMockSubscription() *MockSubscription {
+	return &MockSubscription{
+		errChan: make(chan error, 1),
+		done:    make(chan struct{}),
+	}
 }
 
 // MockPair is a mock implementation of the Pair interface
@@ -384,4 +405,342 @@ func TestSyncEvent(t *testing.T) {
 	require.NotNil(t, update)
 	require.NotNil(t, update.Price)
 	require.NoError(t, update.Error)
+}
+
+func TestErrorHandlingAndRecovery(t *testing.T) {
+	mockClient, mockPair, _, _, _, pairAddr := setupMockPair()
+	service := NewService(mockClient)
+	service.pairs[pairAddr] = mockPair
+
+	// Configure shorter retry intervals for testing
+	service.retryConfig = RetryConfig{
+		MaxAttempts: 2,
+		BackoffMin:  time.Millisecond,
+		BackoffMax:  time.Millisecond * 10,
+	}
+
+	// Test subscription error recovery
+	t.Run("subscription error recovery", func(t *testing.T) {
+		// Reset mock
+		mockPair = new(MockPair)
+		service.pairs[pairAddr] = mockPair
+
+		// Set up initial mock subscription with error channel
+		initialMockSub := NewMockSubscription()
+		initialMockSub.On("Unsubscribe").Return()
+
+		// Set up mock expectations for initial subscription and resubscription
+		mockPair.On("Token0", mock.Anything).Return(common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), nil).Times(3)
+		mockPair.On("Token1", mock.Anything).Return(common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), nil).Times(3)
+
+		// Set up mock expectations for initial GetReserves call
+		mockPair.On("GetReserves", mock.Anything).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{
+			Reserve0:           big.NewInt(1000000),
+			Reserve1:           big.NewInt(500000),
+			BlockTimestampLast: uint32(time.Now().Unix()),
+		}, nil).Times(3)
+
+		// First WatchSync call returns subscription that will error
+		mockPair.On("WatchSync", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+			ch := args.Get(1).(chan<- *bindings.BindingsSync)
+			go func() {
+				// Send initial sync event
+				ch <- &bindings.BindingsSync{
+					Reserve0: big.NewInt(1000000),
+					Reserve1: big.NewInt(500000),
+				}
+				// Send error after a short delay
+				time.Sleep(time.Millisecond * 50)
+				// Send error through the error channel
+				initialMockSub.errChan <- fmt.Errorf("test error")
+				// Give time for error to be processed
+				time.Sleep(time.Millisecond * 50)
+				// Close the sync channel to simulate subscription termination
+				close(ch)
+			}()
+		}).Return(initialMockSub, nil).Once()
+
+		// Set up new mock subscription for recovery
+		newMockSub := NewMockSubscription()
+		newMockSub.On("Unsubscribe").Return()
+
+		// Second WatchSync call returns new subscription after recovery with delay
+		mockPair.On("WatchSync", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+			ch := args.Get(1).(chan<- *bindings.BindingsSync)
+			go func() {
+				time.Sleep(time.Millisecond * 100) // Wait a bit before sending new sync event
+				ch <- &bindings.BindingsSync{
+					Reserve0: big.NewInt(1100000),
+					Reserve1: big.NewInt(550000),
+				}
+			}()
+		}).Return(newMockSub, nil).Once()
+
+		// Set up mock expectations for initial subscription
+		mockPair.On("Token0", mock.Anything).Return(common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), nil).Once()
+		mockPair.On("Token1", mock.Anything).Return(common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), nil).Once()
+		mockPair.On("GetReserves", mock.Anything).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{
+			Reserve0:           big.NewInt(1000000),
+			Reserve1:           big.NewInt(500000),
+			BlockTimestampLast: uint32(time.Now().Unix()),
+		}, nil).Once()
+
+		// Set up mock expectations for resubscription
+		mockPair.On("Token0", mock.Anything).Return(common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), nil).Once()
+		mockPair.On("Token1", mock.Anything).Return(common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), nil).Once()
+		mockPair.On("GetReserves", mock.Anything).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{
+			Reserve0:           big.NewInt(1100000),
+			Reserve1:           big.NewInt(550000),
+			BlockTimestampLast: uint32(time.Now().Unix()),
+		}, nil).Once()
+
+		// Subscribe to price updates
+		sub, err := service.SubscribeToPrice(context.Background(), pairAddr)
+		require.NoError(t, err)
+		require.NotNil(t, sub)
+
+		// Verify initial price update
+		select {
+		case update := <-sub.Updates:
+			require.NotNil(t, update.Price)
+			require.NoError(t, update.Error)
+		case <-time.After(time.Second * 2):
+			t.Fatal("Timeout waiting for initial price update")
+		}
+
+		// Wait for error notification
+		var foundError bool
+		var lastUpdate PriceUpdate
+		timeout := time.After(time.Second * 2) // Increased timeout for reliability
+		for !foundError {
+			select {
+			case update := <-sub.Updates:
+				lastUpdate = update
+				if update.Error != nil && strings.Contains(update.Error.Error(), "subscription error: test error") {
+					foundError = true
+				}
+			case <-timeout:
+				t.Fatalf("Timeout waiting for error notification. Last update received: %+v", lastUpdate)
+			}
+		}
+		require.True(t, foundError, "Should have received subscription error")
+
+		// Should receive info about successful resubscription
+		var foundResubscription bool
+		for i := 0; i < 10; i++ {
+			select {
+			case update := <-sub.Updates:
+				if update.Info != "" && strings.Contains(update.Info, "Successfully resubscribed") {
+					foundResubscription = true
+					break
+				}
+			case <-time.After(time.Millisecond * 100):
+				continue
+			}
+			if foundResubscription {
+				break
+			}
+		}
+		require.True(t, foundResubscription, "Should have received resubscription info")
+
+		// Verify we get updates from the new subscription
+		var foundNewUpdate bool
+		for i := 0; i < 10; i++ {
+			select {
+			case update := <-sub.Updates:
+				if update.Price != nil && update.Error == nil {
+					foundNewUpdate = true
+					break
+				}
+			case <-time.After(time.Millisecond * 100):
+				continue
+			}
+			if foundNewUpdate {
+				break
+			}
+		}
+		require.True(t, foundNewUpdate, "Should have received update from new subscription")
+
+		sub.Unsubscribe()
+	})
+
+	// Test price retrieval retries
+	t.Run("price retrieval retries", func(t *testing.T) {
+		// Reset mock
+		mockPair = new(MockPair)
+		service.pairs[pairAddr] = mockPair
+
+		// Make first call fail, second succeed
+		mockPair.On("GetReserves", mock.Anything).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{}, fmt.Errorf("temporary error")).Once()
+
+		mockPair.On("GetReserves", mock.Anything).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{
+			Reserve0:           big.NewInt(1000000),
+			Reserve1:           big.NewInt(500000),
+			BlockTimestampLast: uint32(time.Now().Unix()),
+		}, nil)
+
+		mockPair.On("Token0", mock.Anything).Return(common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), nil)
+		mockPair.On("Token1", mock.Anything).Return(common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), nil)
+
+		// Set up mock subscription
+		mockSub := &MockSubscription{
+			errChan: make(chan error, 1),
+		}
+		mockSub.On("Unsubscribe").Return()
+		mockPair.On("WatchSync", mock.Anything, mock.Anything).Return(mockSub, nil)
+
+		// Get price with retries
+		price, err := service.GetPrice(context.Background(), pairAddr, nil)
+		require.NoError(t, err)
+		require.NotNil(t, price)
+	})
+
+	// Test max retries exceeded
+	t.Run("max retries exceeded", func(t *testing.T) {
+		// Reset mock
+		mockPair = new(MockPair)
+		service.pairs[pairAddr] = mockPair
+
+		// Set up mock subscription
+		mockSub := &MockSubscription{
+			errChan: make(chan error, 1),
+		}
+		mockSub.On("Unsubscribe").Return()
+		mockPair.On("WatchSync", mock.Anything, mock.Anything).Return(mockSub, nil)
+
+		// Make all calls fail
+		mockPair.On("GetReserves", mock.Anything).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{}, fmt.Errorf("persistent error"))
+
+		mockPair.On("Token0", mock.Anything).Return(common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), nil)
+		mockPair.On("Token1", mock.Anything).Return(common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), nil)
+
+		// Get price with retries
+		_, err := service.GetPrice(context.Background(), pairAddr, nil)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "max retry attempts reached")
+	})
+
+	// Test context cancellation
+	t.Run("context cancellation", func(t *testing.T) {
+		// Reset mock
+		mockPair = new(MockPair)
+		service.pairs[pairAddr] = mockPair
+
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Set up mock subscription
+		mockSub := &MockSubscription{
+			errChan: make(chan error, 1),
+		}
+		mockSub.On("Unsubscribe").Return()
+		mockPair.On("WatchSync", mock.Anything, mock.Anything).Return(mockSub, nil)
+
+		// Set up token expectations
+		mockPair.On("Token0", mock.Anything).Return(common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), nil)
+		mockPair.On("Token1", mock.Anything).Return(common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), nil)
+
+		// Make the call take some time
+		mockPair.On("GetReserves", mock.Anything).Run(func(args mock.Arguments) {
+			time.Sleep(time.Millisecond * 50)
+		}).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{}, fmt.Errorf("slow error"))
+
+		// Cancel context while operation is in progress
+		go func() {
+			time.Sleep(time.Millisecond * 10)
+			cancel()
+		}()
+
+		// Should fail with context cancelled error
+		price, err := service.GetPrice(ctx, pairAddr, nil)
+		require.Error(t, err)
+		require.Nil(t, price)
+		require.Contains(t, err.Error(), "context cancelled")
+	})
+
+	// Test channel overflow handling
+	t.Run("channel overflow handling", func(t *testing.T) {
+		// Reset mock
+		mockPair = new(MockPair)
+		service.pairs[pairAddr] = mockPair
+
+		// Set up mock expectations
+		mockPair.On("Token0", mock.Anything).Return(common.HexToAddress("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), nil)
+		mockPair.On("Token1", mock.Anything).Return(common.HexToAddress("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), nil)
+		mockPair.On("GetReserves", mock.Anything).Return(struct {
+			Reserve0           *big.Int
+			Reserve1           *big.Int
+			BlockTimestampLast uint32
+		}{
+			Reserve0:           big.NewInt(1000000),
+			Reserve1:           big.NewInt(500000),
+			BlockTimestampLast: uint32(time.Now().Unix()),
+		}, nil)
+
+		// Create subscription with small buffer
+		sub := &PriceSubscription{
+			Pair:    pairAddr,
+			Updates: make(chan PriceUpdate, 1), // Small buffer to force overflow
+			done:    make(chan struct{}),
+		}
+
+		// Add subscription to service
+		service.mu.Lock()
+		service.subs[pairAddr] = append(service.subs[pairAddr], sub)
+		service.mu.Unlock()
+
+		// Fill up the channel and trigger warnings
+		for i := 0; i < 10; i++ {
+			service.broadcastWarning(pairAddr, "Dropped price update due to full channel")
+			time.Sleep(time.Millisecond) // Give time for channel operations
+		}
+
+		// Should receive warning about dropped updates
+		var foundWarning bool
+		for i := 0; i < 5; i++ {
+			select {
+			case update := <-sub.Updates:
+				if update.Warning != "" && update.Warning == "Dropped price update due to full channel" {
+					foundWarning = true
+				}
+			case <-time.After(time.Millisecond * 10):
+				continue
+			}
+			if foundWarning {
+				break
+			}
+		}
+		require.True(t, foundWarning, "Should have received warning about dropped updates")
+
+		// Cleanup
+		close(sub.Updates)
+		close(sub.done)
+	})
 }

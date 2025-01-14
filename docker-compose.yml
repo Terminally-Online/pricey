@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    environment:
+      - POSTGRES_USER=pricey
+      - POSTGRES_PASSWORD=pricey
+      - POSTGRES_DB=pricey
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    command: postgres -c max_connections=200
+
+volumes:
+  timescaledb_data:
