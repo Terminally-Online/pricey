@@ -30,6 +30,17 @@ func setupTestDB(t *testing.T) *DB {
 	return db
 }
 
+func cleanupDB(t *testing.T, db *DB) {
+	ctx := context.Background()
+	_, err := db.pool.Exec(ctx, `
+		TRUNCATE TABLE pair_sync_progress CASCADE;
+		TRUNCATE TABLE pair_prices CASCADE;
+		TRUNCATE TABLE pairs CASCADE;
+		TRUNCATE TABLE tokens CASCADE;
+	`)
+	require.NoError(t, err)
+}
+
 func TestDatabaseConnection(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
@@ -42,6 +53,7 @@ func TestDatabaseConnection(t *testing.T) {
 func TestTokenOperations(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
+	defer cleanupDB(t, db)
 
 	ctx := context.Background()
 
@@ -58,6 +70,7 @@ func TestTokenOperations(t *testing.T) {
 func TestPairOperations(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
+	defer cleanupDB(t, db)
 
 	ctx := context.Background()
 
@@ -79,6 +92,7 @@ func TestPairOperations(t *testing.T) {
 func TestPriceOperations(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
+	defer cleanupDB(t, db)
 
 	ctx := context.Background()
 
@@ -120,6 +134,7 @@ func TestPriceOperations(t *testing.T) {
 func TestPairProgressOperations(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
+	defer cleanupDB(t, db)
 
 	ctx := context.Background()
 
@@ -157,6 +172,7 @@ func TestPairProgressOperations(t *testing.T) {
 func TestErrorCases(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
+	defer cleanupDB(t, db)
 
 	ctx := context.Background()
 
@@ -184,6 +200,7 @@ func TestErrorCases(t *testing.T) {
 func TestConcurrentOperations(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
+	defer cleanupDB(t, db)
 
 	ctx := context.Background()
 

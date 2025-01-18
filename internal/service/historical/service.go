@@ -3,10 +3,9 @@ package historical
 import (
 	"context"
 	"fmt"
-	"math/big"
 	"time"
 
-	"pricey/internal/database"
+	"pricey/internal/service/historical/types"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -24,33 +23,24 @@ type Config struct {
 // DefaultConfig returns a default configuration
 func DefaultConfig() Config {
 	return Config{
-		BatchSize:          100,
-		MaxConcurrentPairs: 10,
-		RateLimit:          time.Millisecond * 100,
-		RetryDelay:         time.Second * 5,
+		BatchSize:          50,
+		MaxConcurrentPairs: 5,
+		RateLimit:          time.Second,
+		RetryDelay:         time.Second * 10,
 		MaxRetries:         3,
-		MaxMulticallSize:   500, // Maximum calls in a single multicall request
+		MaxMulticallSize:   100,
 	}
-}
-
-// EthClient defines the interface for Ethereum client operations
-type EthClient interface {
-	// Multicall operations
-	Multicall(ctx context.Context, blockNumber uint64, calls []Call) ([]Result, error)
-	EncodeGetReservesCall(pairAddress common.Address) ([]byte, error)
-	DecodeGetReservesResult(data []byte) (reserve0, reserve1 *big.Int, blockTimestampLast uint32, err error)
-	GetBlockTimes(ctx context.Context, blockNumbers []uint64) (map[uint64]time.Time, error)
 }
 
 // Service manages historical data collection
 type Service struct {
-	db        *database.DB
-	ethClient EthClient
+	db        types.BackfillDB
+	ethClient types.EthClient
 	config    Config
 }
 
 // New creates a new historical data collection service
-func New(db *database.DB, ethClient EthClient, config Config) *Service {
+func New(db types.BackfillDB, ethClient types.EthClient, config Config) *Service {
 	return &Service{
 		db:        db,
 		ethClient: ethClient,
@@ -66,28 +56,38 @@ func (s *Service) CollectHistoricalData(ctx context.Context, pairAddr common.Add
 
 	// Process batches
 	for i := uint64(0); i < numBatches; i++ {
-		var batchStart, batchEnd uint64
-		if backwards {
-			batchEnd = endBlock - (i * uint64(s.config.BatchSize))
-			batchStart = batchEnd - uint64(s.config.BatchSize) + 1
-			if batchStart < startBlock {
-				batchStart = startBlock
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			var batchStart, batchEnd uint64
+			if backwards {
+				batchEnd = endBlock - (i * uint64(s.config.BatchSize))
+				batchStart = batchEnd - uint64(s.config.BatchSize) + 1
+				if batchStart < startBlock {
+					batchStart = startBlock
+				}
+			} else {
+				batchStart = startBlock + (i * uint64(s.config.BatchSize))
+				batchEnd = batchStart + uint64(s.config.BatchSize) - 1
+				if batchEnd > endBlock {
+					batchEnd = endBlock
+				}
 			}
-		} else {
-			batchStart = startBlock + (i * uint64(s.config.BatchSize))
-			batchEnd = batchStart + uint64(s.config.BatchSize) - 1
-			if batchEnd > endBlock {
-				batchEnd = endBlock
+
+			// Add delay between batches for rate limiting
+			if i > 0 {
+				time.Sleep(s.config.RateLimit)
 			}
-		}
 
-		if err := s.processBatch(ctx, pairAddr, batchStart, batchEnd); err != nil {
-			return fmt.Errorf("error processing batch %d: %w", i, err)
-		}
+			if err := s.processBatch(ctx, pairAddr, batchStart, batchEnd); err != nil {
+				return fmt.Errorf("error processing batch %d: %w", i, err)
+			}
 
-		// Store progress checkpoint
-		if err := s.db.UpdatePairProgress(ctx, pairAddr.Bytes(), batchEnd); err != nil {
-			return fmt.Errorf("error updating progress: %w", err)
+			// Store progress checkpoint
+			if err := s.db.UpdatePairProgress(ctx, pairAddr.Bytes(), batchEnd); err != nil {
+				return fmt.Errorf("error updating progress: %w", err)
+			}
 		}
 	}
 
@@ -108,13 +108,13 @@ func (s *Service) processBatch(ctx context.Context, pairAddr common.Address, sta
 	}
 
 	// Prepare multicall data for getting reserves
-	calls := make([]Call, 0, endBlock-startBlock+1)
+	calls := make([]types.Call, 0, endBlock-startBlock+1)
 	for block := startBlock; block <= endBlock; block++ {
 		callData, err := s.ethClient.EncodeGetReservesCall(pairAddr)
 		if err != nil {
 			return fmt.Errorf("error encoding getReserves call for block %d: %w", block, err)
 		}
-		calls = append(calls, Call{
+		calls = append(calls, types.Call{
 			Target:   pairAddr,
 			CallData: callData,
 		})

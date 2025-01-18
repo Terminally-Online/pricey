@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -170,4 +171,44 @@ func (db *DB) GetPairProgress(ctx context.Context, pairAddress []byte) (uint64, 
 		return 0, fmt.Errorf("error getting pair progress: %w", err)
 	}
 	return lastBlock, nil
+}
+
+// GetPairsForBackfill gets pairs that need historical data collection
+func (db *DB) GetPairsForBackfill(ctx context.Context, limit int) ([]common.Address, error) {
+	query := `
+		WITH pair_blocks AS (
+			SELECT p.address, p.created_at_block,
+				   COALESCE(sp.last_processed_block, p.created_at_block) as last_processed,
+				   (SELECT MAX(block_number) FROM pair_prices WHERE pair_address = p.address) as max_processed_block
+			FROM pairs p
+			LEFT JOIN pair_sync_progress sp ON p.address = sp.pair_address
+		)
+		SELECT encode(address, 'hex')
+		FROM pair_blocks
+		WHERE last_processed > 0
+		ORDER BY (max_processed_block - last_processed) DESC NULLS FIRST,
+		         last_processed DESC
+		LIMIT $1
+	`
+
+	rows, err := db.pool.Query(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("error querying pairs for backfill: %w", err)
+	}
+	defer rows.Close()
+
+	var pairs []common.Address
+	for rows.Next() {
+		var addrHex string
+		if err := rows.Scan(&addrHex); err != nil {
+			return nil, fmt.Errorf("error scanning pair address: %w", err)
+		}
+		pairs = append(pairs, common.HexToAddress(addrHex))
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating pairs: %w", err)
+	}
+
+	return pairs, nil
 }

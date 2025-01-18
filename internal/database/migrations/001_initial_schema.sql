@@ -19,7 +19,7 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- Create tokens table
 CREATE TABLE IF NOT EXISTS tokens (
     address BYTEA PRIMARY KEY,
-    symbol VARCHAR(10) NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
     decimals INTEGER NOT NULL,
     token_type token_type NOT NULL DEFAULT 'standard',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
