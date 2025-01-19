@@ -59,11 +59,11 @@ func TestTokenOperations(t *testing.T) {
 
 	// Test token insertion
 	tokenAddr := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
-	err := db.InsertToken(ctx, tokenAddr, "TEST", 18, "standard")
+	err := db.InsertToken(ctx, tokenAddr, "Test Token", "TEST", 18, "standard")
 	require.NoError(t, err)
 
 	// Test token update
-	err = db.InsertToken(ctx, tokenAddr, "TEST2", 18, "stable")
+	err = db.InsertToken(ctx, tokenAddr, "Test Token 2", "TEST2", 18, "stable")
 	require.NoError(t, err)
 }
 
@@ -78,9 +78,9 @@ func TestPairOperations(t *testing.T) {
 	token0 := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 	token1 := []byte{20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
 
-	err := db.InsertToken(ctx, token0, "TKN0", 18, "standard")
+	err := db.InsertToken(ctx, token0, "Token Zero", "TKN0", 18, "standard")
 	require.NoError(t, err)
-	err = db.InsertToken(ctx, token1, "TKN1", 18, "standard")
+	err = db.InsertToken(ctx, token1, "Token One", "TKN1", 18, "standard")
 	require.NoError(t, err)
 
 	// Test pair insertion
@@ -101,9 +101,9 @@ func TestPriceOperations(t *testing.T) {
 	token1 := []byte{20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
 	pairAddr := []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
 
-	err := db.InsertToken(ctx, token0, "TKN0", 18, "standard")
+	err := db.InsertToken(ctx, token0, "Token Zero", "TKN0", 18, "standard")
 	require.NoError(t, err)
-	err = db.InsertToken(ctx, token1, "TKN1", 18, "standard")
+	err = db.InsertToken(ctx, token1, "Token One", "TKN1", 18, "standard")
 	require.NoError(t, err)
 	err = db.InsertPair(ctx, pairAddr, token0, token1, 12345)
 	require.NoError(t, err)
@@ -186,7 +186,7 @@ func TestErrorCases(t *testing.T) {
 	require.Error(t, err) // Should return error for non-existent pair
 
 	// Test invalid token insertion (nil address)
-	err = db.InsertToken(ctx, nil, "TEST", 18, "standard")
+	err = db.InsertToken(ctx, nil, "Test Token", "TEST", 18, "standard")
 	require.Error(t, err)
 
 	// Test invalid pair insertion (missing tokens)
@@ -209,9 +209,9 @@ func TestConcurrentOperations(t *testing.T) {
 	token1 := []byte{20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
 	pairAddr := []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
 
-	err := db.InsertToken(ctx, token0, "TKN0", 18, "standard")
+	err := db.InsertToken(ctx, token0, "Token Zero", "TKN0", 18, "standard")
 	require.NoError(t, err)
-	err = db.InsertToken(ctx, token1, "TKN1", 18, "standard")
+	err = db.InsertToken(ctx, token1, "Token One", "TKN1", 18, "standard")
 	require.NoError(t, err)
 	err = db.InsertPair(ctx, pairAddr, token0, token1, 12345)
 	require.NoError(t, err)

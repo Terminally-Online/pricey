@@ -22,16 +22,16 @@ type Result struct {
 	ReturnData []byte
 }
 
-// EthClient defines the interface for Ethereum client operations
+// EthClient defines the interface for interacting with Ethereum
 type EthClient interface {
 	// Multicall operations
 	Multicall(ctx context.Context, blockNumber uint64, calls []Call) ([]Result, error)
 	TryAggregate(ctx context.Context, requireSuccess bool, calls []Call) ([]Result, error)
-	EncodeGetReservesCall(pairAddress common.Address) ([]byte, error)
-	DecodeGetReservesResult(data []byte) (reserve0, reserve1 *big.Int, blockTimestampLast uint32, err error)
+	EncodeGetReservesCall(pairAddr common.Address) ([]byte, error)
+	DecodeGetReservesResult(data []byte) (*big.Int, *big.Int, uint32, error)
 	GetBlockTimes(ctx context.Context, blockNumbers []uint64) (map[uint64]time.Time, error)
 	GetCurrentBlock(ctx context.Context) (uint64, error)
-	FilterLogs(ctx context.Context, q ethereum.FilterQuery) ([]types.Log, error)
+	FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]types.Log, error)
 	CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
 	// Additional ContractBackend methods
 	CodeAt(ctx context.Context, contract common.Address, blockNumber *big.Int) ([]byte, error)
@@ -46,15 +46,67 @@ type EthClient interface {
 	// ERC20 methods
 	EncodeERC20Call(method string, args []interface{}) ([]byte, error)
 	DecodeERC20Result(method string, data []byte) (interface{}, error)
+	GetPairTokens(ctx context.Context, pairAddr common.Address) (token0, token1 common.Address, err error)
+	GetTokenDecimals(ctx context.Context, tokenAddr common.Address) (uint8, error)
+	GetTokensDecimals(ctx context.Context, tokenAddrs []common.Address) ([]uint8, error)
+	GetTokenMetadata(ctx context.Context, tokenAddr common.Address) (*TokenMetadata, error)
+	GetTokensMetadata(ctx context.Context, tokenAddrs []common.Address) ([]*TokenMetadata, error)
 }
 
-// BackfillDB defines the database interface needed for backfill operations
+// Token represents a token in the database
+type Token struct {
+	Symbol   string
+	Name     string
+	Decimals int
+}
+
+// BackfillDB defines the database interface for historical data collection
 type BackfillDB interface {
-	InsertPairPrice(ctx context.Context, pairAddress []byte, blockNumber int64, blockTime time.Time,
-		reserves0, reserves1, price0USD, price1USD, tvlUSD, confidence float64) error
-	UpdatePairProgress(ctx context.Context, pairAddress []byte, lastProcessedBlock uint64) error
 	GetPairProgress(ctx context.Context, pairAddress []byte) (uint64, error)
+	UpdatePairProgress(ctx context.Context, pairAddress []byte, lastProcessedBlock uint64) error
+	GetGlobalSyncProgress(ctx context.Context) (uint64, error)
+	UpdateGlobalSyncProgress(ctx context.Context, lastProcessedBlock uint64) error
 	GetPairsForBackfill(ctx context.Context, limit int) ([]common.Address, error)
-	InsertToken(ctx context.Context, address []byte, symbol string, decimals int, tokenType string) error
+	InsertToken(ctx context.Context, address []byte, name string, symbol string, decimals int, tokenType string) error
 	InsertPair(ctx context.Context, address, token0, token1 []byte, createdAtBlock int64) error
+	InsertPairPrice(ctx context.Context, pairAddress []byte, blockNumber int64, blockTime time.Time,
+		reserves0, reserves1 float64, price0Usd, price1Usd, tvlUsd, confidence float64) error
+	GetPair(ctx context.Context, pairAddress []byte) (*Pair, error)
+	GetToken(ctx context.Context, address []byte) (*Token, error)
+}
+
+// Pair represents a trading pair
+type Pair struct {
+	Address        []byte
+	Token0Address  []byte
+	Token1Address  []byte
+	CreatedAtBlock int64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+// Config holds all configuration for historical data collection
+type Config struct {
+	MaxRetries         int
+	RetryDelay         time.Duration
+	MaxConcurrentPairs int
+	BlockRange         uint64
+	RateLimit          time.Duration
+}
+
+func DefaultConfig() Config {
+	return Config{
+		MaxRetries:         5,
+		RetryDelay:         time.Second * 5,
+		MaxConcurrentPairs: 10,
+		BlockRange:         50000,
+		RateLimit:          time.Millisecond * 200,
+	}
+}
+
+// TokenMetadata represents the metadata for a token
+type TokenMetadata struct {
+	Name     string
+	Symbol   string
+	Decimals uint8
 }

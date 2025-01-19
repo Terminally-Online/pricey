@@ -107,6 +107,22 @@ func (s *Service) processBatch(ctx context.Context, pairAddr common.Address, sta
 		return fmt.Errorf("error getting block times: %w", err)
 	}
 
+	// Get token addresses and decimals for price calculation
+	token0, token1, err := s.ethClient.GetPairTokens(ctx, pairAddr)
+	if err != nil {
+		return fmt.Errorf("error getting pair tokens: %w", err)
+	}
+
+	token0Dec, err := s.ethClient.GetTokenDecimals(ctx, token0)
+	if err != nil {
+		return fmt.Errorf("error getting token0 decimals: %w", err)
+	}
+
+	token1Dec, err := s.ethClient.GetTokenDecimals(ctx, token1)
+	if err != nil {
+		return fmt.Errorf("error getting token1 decimals: %w", err)
+	}
+
 	// Prepare multicall data for getting reserves
 	calls := make([]types.Call, 0, endBlock-startBlock+1)
 	for block := startBlock; block <= endBlock; block++ {
@@ -149,11 +165,25 @@ func (s *Service) processBatch(ctx context.Context, pairAddr common.Address, sta
 			blockNum := startBlock + uint64(i) + uint64(j)
 			blockTime := blockTimes[blockNum]
 
+			// Calculate prices adjusted for decimals
+			decimalAdjustment := float64(10) * float64(token1Dec-token0Dec)
+			reserve0Float := float64(reserves0.Uint64()) * decimalAdjustment
+			reserve1Float := float64(reserves1.Uint64())
+
+			var price0USD, price1USD float64
+			if reserve0Float > 0 && reserve1Float > 0 {
+				price0USD = reserve1Float / reserve0Float
+				price1USD = reserve0Float / reserve1Float
+			}
+
+			// Calculate TVL (in terms of token1)
+			tvl := reserve1Float + (reserve0Float * price0USD)
+
 			// Store in database
 			if err := s.db.InsertPairPrice(ctx, pairAddr.Bytes(), int64(blockNum), blockTime,
 				float64(reserves0.Uint64()), float64(reserves1.Uint64()),
-				0, 0, // Prices will be calculated by a separate service
-				0,   // TVL will be calculated by a separate service
+				price0USD, price1USD,
+				tvl,
 				1.0, // Historical data has high confidence
 			); err != nil {
 				return fmt.Errorf("error inserting pair price for block %d: %w", blockNum, err)

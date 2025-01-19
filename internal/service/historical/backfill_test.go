@@ -139,8 +139,8 @@ func (m *MockDB) GetPairsForBackfill(ctx context.Context, limit int) ([]common.A
 	return args.Get(0).([]common.Address), args.Error(1)
 }
 
-func (m *MockDB) InsertToken(ctx context.Context, address []byte, symbol string, decimals int, tokenType string) error {
-	args := m.Called(ctx, address, symbol, decimals, tokenType)
+func (m *MockDB) InsertToken(ctx context.Context, address []byte, name string, symbol string, decimals int, tokenType string) error {
+	args := m.Called(ctx, address, name, symbol, decimals, tokenType)
 	return args.Error(0)
 }
 

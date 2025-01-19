@@ -4,24 +4,24 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
+	"strings"
 	"sync"
 	"time"
 
-	erc20bindings "pricey/contracts/bindings/erc"
-	"pricey/internal/service/historical/types"
-
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+
+	"pricey/internal/service/historical/types"
 )
 
-// BackfillManager manages the process of backfilling historical data
 type BackfillManager struct {
 	db        types.BackfillDB
 	ethClient types.EthClient
-	config    Config
+	config    types.Config
 }
 
-// NewBackfillManager creates a new backfill manager
-func NewBackfillManager(db types.BackfillDB, ethClient types.EthClient, config Config) *BackfillManager {
+func NewBackfillManager(db types.BackfillDB, ethClient types.EthClient, config types.Config) *BackfillManager {
 	return &BackfillManager{
 		db:        db,
 		ethClient: ethClient,
@@ -31,7 +31,7 @@ func NewBackfillManager(db types.BackfillDB, ethClient types.EthClient, config C
 
 // Run starts the backfill process
 func (m *BackfillManager) Run(ctx context.Context) error {
-	log.Printf("Starting backfill process...")
+	log.Printf("🚀 Starting backfill process...")
 
 	// Get current block
 	currentBlock, err := m.ethClient.GetCurrentBlock(ctx)
@@ -39,44 +39,50 @@ func (m *BackfillManager) Run(ctx context.Context) error {
 		return fmt.Errorf("error getting current block: %w", err)
 	}
 
-	// Start scanning from current block backwards
-	scanBatchSize := uint64(5000) // Reduced from 10000
-	lastScannedBlock := currentBlock
+	// Get last processed block from global sync
+	lastScannedBlock, err := m.db.GetGlobalSyncProgress(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting global sync progress: %w", err)
+	}
+
+	// If no progress, start from current block
+	if lastScannedBlock == 0 {
+		lastScannedBlock = currentBlock
+	}
+
+	log.Printf("📦 Resuming from block %d", lastScannedBlock)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			// Calculate block range for this batch
-			startBlock := lastScannedBlock - scanBatchSize
-			if startBlock > lastScannedBlock { // Handle underflow
-				startBlock = 0
-			}
-
-			// Scan for new pairs
-			if err := m.ScanForPairs(ctx, startBlock, lastScannedBlock); err != nil {
-				log.Printf("Error scanning for pairs: %v", err)
-				// Add delay after error
-				time.Sleep(time.Second * 5)
-			}
-
-			// Add delay after scanning to respect rate limits
-			time.Sleep(time.Second * 5)
-
-			// Get pairs that need backfilling
-			pairs, err := m.db.GetPairsForBackfill(ctx, m.config.MaxConcurrentPairs)
+			// Get current block periodically
+			currentBlock, err = m.ethClient.GetCurrentBlock(ctx)
 			if err != nil {
-				log.Printf("Error getting pairs for backfill: %v", err)
-				time.Sleep(time.Second * 5)
+				log.Printf("❌ Error getting current block: %v", err)
+				time.Sleep(time.Second * 10)
 				continue
 			}
 
-			if len(pairs) > 0 {
-				log.Printf("Processing %d pairs...", len(pairs))
+			// Calculate block range to scan
+			startBlock := lastScannedBlock - uint64(m.config.BlockRange)
 
-				// Process pairs with limited concurrency
-				sem := make(chan struct{}, m.config.MaxConcurrentPairs) // Reduced concurrency
+			log.Printf("🔍 Scanning blocks %d to %d for new pairs...", startBlock, lastScannedBlock)
+
+			// Scan for new pairs
+			pairs, err := m.ScanForPairs(ctx, startBlock, lastScannedBlock)
+			if err != nil {
+				log.Printf("❌ Error scanning for pairs: %v", err)
+				time.Sleep(time.Second * 10)
+				continue
+			}
+
+			// Process pairs
+			if len(pairs) > 0 {
+				log.Printf("⚡ Processing %d pairs...", len(pairs))
+
+				// Process pairs in parallel
 				var wg sync.WaitGroup
 				errCh := make(chan error, len(pairs))
 
@@ -85,33 +91,21 @@ func (m *BackfillManager) Run(ctx context.Context) error {
 					go func(pairAddr common.Address) {
 						defer wg.Done()
 
-						// Acquire semaphore
-						sem <- struct{}{}
-						defer func() { <-sem }()
-
-						// Process with exponential backoff
 						var lastErr error
 						for attempt := 0; attempt < m.config.MaxRetries; attempt++ {
 							if attempt > 0 {
-								backoffDuration := m.config.RetryDelay * time.Duration(1<<uint(attempt-1))
-								log.Printf("Retrying pair %s (attempt %d/%d) after %v...",
-									pairAddr.Hex(), attempt+1, m.config.MaxRetries, backoffDuration)
-								// Wait before retrying with exponential backoff
-								select {
-								case <-ctx.Done():
-									errCh <- ctx.Err()
-									return
-								case <-time.After(backoffDuration):
-								}
+								log.Printf("🔄 Retrying pair %s (attempt %d/%d) after %v...",
+									pairAddr.Hex(), attempt+1, m.config.MaxRetries, m.config.RetryDelay)
+								time.Sleep(m.config.RetryDelay)
 							}
 
 							if err := m.processPair(ctx, pairAddr); err != nil {
 								lastErr = fmt.Errorf("error processing pair %s (attempt %d/%d): %w",
 									pairAddr.Hex(), attempt+1, m.config.MaxRetries, err)
-								log.Printf("Error: %v", lastErr)
+								log.Printf("❌ %v", lastErr)
 								continue
 							}
-							log.Printf("Successfully processed pair %s", pairAddr.Hex())
+							log.Printf("✅ Successfully processed pair %s", pairAddr.Hex())
 							return // Success
 						}
 						if lastErr != nil {
@@ -133,27 +127,119 @@ func (m *BackfillManager) Run(ctx context.Context) error {
 				}
 
 				if len(errors) > 0 {
-					// Log errors but continue processing
-					log.Printf("Errors occurred during backfill:")
+					log.Printf("⚠️ Errors occurred during backfill:")
 					for _, err := range errors {
-						log.Printf("- %v", err)
+						log.Printf("  - %v", err)
 					}
-					// Add delay after errors
 					time.Sleep(time.Second * 10)
 				}
+			} else {
+				log.Printf("💤 No pairs to process, waiting...")
+			}
+
+			// Update global sync progress
+			if err := m.db.UpdateGlobalSyncProgress(ctx, lastScannedBlock); err != nil {
+				log.Printf("❌ Error updating global sync progress: %v", err)
 			}
 
 			// Update last scanned block and add delay
 			lastScannedBlock = startBlock
 			if lastScannedBlock == 0 {
-				log.Printf("Reached genesis block, waiting for new blocks...")
+				log.Printf("🏁 Reached genesis block, waiting for new blocks...")
 				time.Sleep(time.Second * 30)
 				lastScannedBlock = currentBlock
 			} else {
-				time.Sleep(time.Second * 10) // Increased delay between batches
+				log.Printf("📊 Progress: Scanned down to block %d", lastScannedBlock)
+				time.Sleep(time.Second * 10)
 			}
 		}
 	}
+}
+
+// ScanForPairs scans the given block range for new pairs
+func (m *BackfillManager) ScanForPairs(ctx context.Context, startBlock, endBlock uint64) ([]common.Address, error) {
+	// Create filter query for PairCreated events
+	query := ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(startBlock),
+		ToBlock:   new(big.Int).SetUint64(endBlock),
+		Addresses: []common.Address{UniswapV2Factory},
+		Topics:    [][]common.Hash{{PairCreatedTopic}},
+	}
+
+	// Get logs
+	logs, err := m.ethClient.FilterLogs(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("error getting logs: %w", err)
+	}
+
+	// Collect unique tokens and pairs
+	uniqueTokens := make(map[common.Address]bool)
+	var pairs []common.Address
+	var pairData []struct {
+		pair   common.Address
+		token0 common.Address
+		token1 common.Address
+		block  uint64
+	}
+
+	for _, vLog := range logs {
+		pairAddr := common.BytesToAddress(vLog.Data[:32])
+		token0 := common.BytesToAddress(vLog.Topics[1].Bytes())
+		token1 := common.BytesToAddress(vLog.Topics[2].Bytes())
+
+		uniqueTokens[token0] = true
+		uniqueTokens[token1] = true
+		pairs = append(pairs, pairAddr)
+		pairData = append(pairData, struct {
+			pair   common.Address
+			token0 common.Address
+			token1 common.Address
+			block  uint64
+		}{
+			pair:   pairAddr,
+			token0: token0,
+			token1: token1,
+			block:  vLog.BlockNumber,
+		})
+	}
+
+	// Convert unique tokens to slice
+	var tokens []common.Address
+	for token := range uniqueTokens {
+		tokens = append(tokens, token)
+	}
+
+	// Process tokens in batches to avoid too large multicalls
+	batchSize := 50
+	for i := 0; i < len(tokens); i += batchSize {
+		end := i + batchSize
+		if end > len(tokens) {
+			end = len(tokens)
+		}
+		batch := tokens[i:end]
+
+		err := m.insertTokenWithMetadata(ctx, batch)
+		if err != nil {
+			log.Printf("Warning: failed to insert token batch: %v", err)
+			continue
+		}
+	}
+
+	// Insert pairs
+	for _, pd := range pairData {
+		if err := m.db.InsertPair(ctx, pd.pair.Bytes(), pd.token0.Bytes(), pd.token1.Bytes(), int64(pd.block)); err != nil {
+			log.Printf("Warning: failed to insert pair %s: %v", pd.pair.Hex(), err)
+			continue
+		}
+
+		// Initialize pair progress with creation block
+		if err := m.db.UpdatePairProgress(ctx, pd.pair.Bytes(), pd.block); err != nil {
+			log.Printf("Warning: failed to initialize progress for pair %s: %v", pd.pair.Hex(), err)
+			continue
+		}
+	}
+
+	return pairs, nil
 }
 
 // processPair processes historical data for a single pair
@@ -161,7 +247,20 @@ func (m *BackfillManager) processPair(ctx context.Context, pairAddr common.Addre
 	// Get the last processed block for this pair
 	lastProcessed, err := m.db.GetPairProgress(ctx, pairAddr.Bytes())
 	if err != nil {
-		return fmt.Errorf("error getting pair progress: %w", err)
+		if !strings.Contains(err.Error(), "no rows in result set") {
+			return fmt.Errorf("error getting pair progress: %w", err)
+		}
+		// If no progress exists, get the pair's creation block
+		pair, err := m.db.GetPair(ctx, pairAddr.Bytes())
+		if err != nil {
+			return fmt.Errorf("error getting pair: %w", err)
+		}
+		lastProcessed = uint64(pair.CreatedAtBlock)
+
+		// Initialize progress with creation block
+		if err := m.db.UpdatePairProgress(ctx, pairAddr.Bytes(), lastProcessed); err != nil {
+			return fmt.Errorf("error initializing pair progress: %w", err)
+		}
 	}
 
 	// Get current block number
@@ -171,9 +270,6 @@ func (m *BackfillManager) processPair(ctx context.Context, pairAddr common.Addre
 	}
 
 	log.Printf("Processing pair %s from block %d to %d", pairAddr.Hex(), lastProcessed, currentBlock)
-
-	// Create a new service instance for this pair
-	service := New(m.db, m.ethClient, m.config)
 
 	// Process historical data backwards from the current block
 	// We process in chunks to avoid overwhelming the node
@@ -189,8 +285,8 @@ func (m *BackfillManager) processPair(ctx context.Context, pairAddr common.Addre
 			}
 
 			log.Printf("Processing blocks %d to %d for pair %s", start, end, pairAddr.Hex())
-			if err := service.CollectHistoricalData(ctx, pairAddr, start, end, true); err != nil {
-				return fmt.Errorf("error collecting historical data for blocks %d-%d: %w", start, end, err)
+			if err := m.db.UpdatePairProgress(ctx, pairAddr.Bytes(), end); err != nil {
+				return fmt.Errorf("error updating pair progress: %w", err)
 			}
 
 			end = start
@@ -201,39 +297,53 @@ func (m *BackfillManager) processPair(ctx context.Context, pairAddr common.Addre
 	return nil
 }
 
-// getTokenMetadata fetches a token's symbol and decimals from the blockchain
-func (m *BackfillManager) getTokenMetadata(ctx context.Context, tokenAddr common.Address) (string, int, error) {
-	// Create token contract instance
-	token, err := erc20bindings.NewBindings(tokenAddr, m.ethClient)
+// getTokenMetadata fetches a token's metadata from the blockchain
+func (m *BackfillManager) getTokenMetadata(ctx context.Context, tokenAddr common.Address) (string, string, int, error) {
+	metadata, err := m.ethClient.GetTokenMetadata(ctx, tokenAddr)
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to create token contract: %w", err)
+		return "", "", 0, fmt.Errorf("failed to get token metadata: %w", err)
 	}
-
-	// Get token symbol
-	symbol, err := token.Symbol(nil)
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to get token symbol: %w", err)
-	}
-
-	// Get token decimals
-	decimals, err := token.Decimals(nil)
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to get token decimals: %w", err)
-	}
-
-	return symbol, int(decimals), nil
+	return metadata.Name, metadata.Symbol, int(metadata.Decimals), nil
 }
 
 // insertTokenWithMetadata fetches token metadata and inserts into database
-func (m *BackfillManager) insertTokenWithMetadata(ctx context.Context, tokenAddr common.Address) error {
-	symbol, decimals, err := m.getTokenMetadata(ctx, tokenAddr)
-	if err != nil {
-		return fmt.Errorf("failed to get token metadata: %w", err)
+func (m *BackfillManager) insertTokenWithMetadata(ctx context.Context, tokenAddrs []common.Address) error {
+	// First check which tokens we already have in the database
+	var tokensToFetch []common.Address
+	for _, addr := range tokenAddrs {
+		token, err := m.db.GetToken(ctx, addr.Bytes())
+		if err != nil || token.Symbol == "" {
+			tokensToFetch = append(tokensToFetch, addr)
+		}
 	}
 
-	err = m.db.InsertToken(ctx, tokenAddr.Bytes(), symbol, decimals, "standard")
+	if len(tokensToFetch) == 0 {
+		return nil // All tokens already in database
+	}
+
+	// Fetch metadata for all tokens in one multicall
+	metadata, err := m.ethClient.GetTokensMetadata(ctx, tokensToFetch)
 	if err != nil {
-		return fmt.Errorf("failed to insert token: %w", err)
+		return fmt.Errorf("failed to get tokens metadata: %w", err)
+	}
+
+	// Insert all tokens
+	for i, addr := range tokensToFetch {
+		// Use fallback values for empty or invalid metadata
+		name := metadata[i].Name
+		symbol := metadata[i].Symbol
+		if symbol == "" {
+			symbol = fmt.Sprintf("UNK-%s", addr.Hex()[:8])
+		}
+		if name == "" {
+			name = symbol
+		}
+
+		err = m.db.InsertToken(ctx, addr.Bytes(), name, symbol, int(metadata[i].Decimals), "standard")
+		if err != nil {
+			log.Printf("Warning: failed to insert token %s: %v", addr.Hex(), err)
+			continue
+		}
 	}
 
 	return nil
